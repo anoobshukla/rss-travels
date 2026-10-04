@@ -159,5 +159,58 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Contact number',r.json()['detail'])
         self.assertNotIn('assword',r.json()['detail'])
 
+    async def test_future_booking_dates_source_and_owner_notices(self):
+        from unittest.mock import patch
+        from datetime import timedelta
+        employee, eu = await self.user('notice-employee', 'employee')
+        other, _ = await self.user('notice-other', 'employee')
+        with patch('server.business_today',return_value=server.date(2026,10,5)):
+            for day in ('2026-10-04','2026-10-05'):
+                result=await employee.post('/api/bookings',json={**self.booking(),'date':day})
+                self.assertEqual(result.status_code,422)
+            payload={**self.booking(),'date':'2026-10-06','source':'Phone referral'}
+            created=await employee.post('/api/bookings',json=payload)
+            self.assertEqual(created.status_code,201,created.text)
+            b=created.json();self.assertEqual(b['source'],'Phone referral')
+            path='/api/bookings/'+b['id']
+            edit={k:payload[k] for k in ('name','phone','car','from','to','date','time','purpose','total','source')};edit['version']=b['version']
+            self.assertEqual((await self.owner.post(path+'/update',json={**edit,'date':'2026-10-05'})).status_code,422)
+            changed=await self.owner.post(path+'/update',json={**edit,'car':'BMW 5 Series'})
+            self.assertEqual(changed.status_code,200,changed.text)
+            notes=(await employee.get('/api/notifications')).json()
+            self.assertEqual(len(notes),1);self.assertFalse(notes[0]['read'])
+            self.assertNotIn('recipients',notes[0])
+            self.assertEqual((await other.get('/api/notifications')).json(),[])
+            await other.post('/api/notifications/read',json={'ids':[notes[0]['id']]})
+            self.assertFalse((await employee.get('/api/notifications')).json()[0]['read'])
+            await employee.post('/api/notifications/read',json={'ids':[notes[0]['id']]})
+            self.assertTrue((await employee.get('/api/notifications')).json()[0]['read'])
+            self.assertEqual((await self.owner.post(path+'/update',json=edit)).status_code,409)
+            self.assertEqual(len((await employee.get('/api/notifications')).json()),1)
+            version=changed.json()['version']
+            self.assertEqual((await employee.post(path+'/delete',json={'version':version})).status_code,403)
+            self.assertEqual((await self.owner.post(path+'/delete',json={'version':version})).status_code,200)
+            self.assertEqual((await employee.get('/api/bookings')).json(),[])
+            self.assertEqual((await employee.get('/api/bookings?deleted=true')).status_code,403)
+            self.assertEqual((await self.owner.post(path+'/payments',json={'amount':1,'mode':'Cash','requestId':str(uuid.uuid4())})).status_code,404)
+            archived=(await self.owner.get('/api/bookings?deleted=true')).json()[0]
+            self.assertFalse(archived['canEdit']);self.assertFalse(archived['canPay'])
+            restored=await self.owner.post(path+'/restore',json={'version':archived['version']})
+            self.assertEqual(restored.status_code,200)
+            active=(await employee.get('/api/bookings')).json()[0]
+            self.assertEqual(active['payments'],b['payments']);self.assertTrue(active['isMine'])
+            self.assertEqual((await self.owner.get('/api/bookings?deleted=true')).json(),[])
+
+    async def test_role_correction_refreshes_driver_list_and_revokes_session(self):
+        customer, user = await self.user('role-correction', 'customer')
+        employee, _ = await self.user('role-employee', 'employee')
+        path='/api/users/'+user['id']+'/role'
+        self.assertEqual((await employee.post(path,json={'role':'driver'})).status_code,403)
+        self.assertEqual((await self.owner.post(path,json={'role':'owner'})).status_code,422)
+        self.assertEqual((await self.owner.post(path,json={'role':'driver'})).status_code,200)
+        self.assertEqual((await customer.get('/api/me')).status_code,401)
+        self.assertIn(user['id'],[d['id'] for d in (await employee.get('/api/drivers')).json()])
+        self.assertNotIn(user['id'],[d['id'] for d in (await employee.get('/api/customers')).json()])
+
 if __name__ == '__main__':
     unittest.main()

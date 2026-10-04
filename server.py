@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -259,6 +259,7 @@ class Booking(BaseModel):
     total: float = Field(ge=0, le=10000000, allow_inf_nan=False)
     advance: float = Field(ge=0, le=10000000, allow_inf_nan=False)
     mode: str
+    source: str = Field(default='', max_length=200)
     driverId: str = Field(default='', max_length=64)
     customerEmail: str = Field(default='', max_length=254)
     requestId: str = Field(pattern=r'^[a-f0-9-]{36}$')
@@ -290,10 +291,10 @@ def booking_view(b, user=None):
     financial = user is None or user['role'] in ('owner', 'customer') or manages(user, b)
     keys = ('id', 'name', 'phone', 'secondary', 'car', 'from', 'to', 'date', 'time', 'purpose', 'status', 'driverId', 'driverName', 'startedAt', 'completedAt')
     result = {k: b.get(k, '') for k in keys}
-    result.update(version=b.get('version', 1), customerId=b.get('customerId'), financialVisible=financial,
+    result.update(deleted=bool(b.get('deletedAt')), canDelete=user is not None and user['role'] == 'owner' and not b.get('deletedAt') and b['status'] != 'In progress', version=b.get('version', 1), customerId=b.get('customerId'), financialVisible=financial,
                   isMine=user is not None and b.get('createdBy') == user['id'],
-                  canEdit=user is not None and manages(user, b) and b['status'] not in ('In progress', 'Completed', 'Cancelled'))
-    operator = user is not None and (user['role'] in ('owner', 'employee') or (user['role'] == 'driver' and b.get('driverId') == user['id']))
+                  canEdit=user is not None and not b.get('deletedAt') and manages(user, b) and b['status'] not in ('In progress', 'Completed', 'Cancelled'))
+    operator = not b.get('deletedAt') and user is not None and (user['role'] in ('owner', 'employee') or (user['role'] == 'driver' and b.get('driverId') == user['id']))
     on_date = b.get('date') == str(business_today())
     result['canStart'] = operator and on_date and b['status'] in ('Pending', 'Confirmed')
     result['canComplete'] = operator and on_date and b['status'] == 'In progress'
@@ -301,7 +302,9 @@ def booking_view(b, user=None):
         result.update(total=b['totalCents'] / 100 if b.get('totalCents') is not None else None,
                       receipt=b.get('receipt', ''), importSource=b.get('importSource'),
                       payments=[{k: v for k, v in p.items() if k not in ('cents', 'requestId')} | {'amount': p['cents'] / 100} for p in b['payments']],
-                      canPay=user is not None and manages(user, b))
+                      canPay=user is not None and not b.get('deletedAt') and manages(user, b))
+    if user and user['role'] in ('owner', 'employee'):
+        result['source'] = b.get('source', '')
     return result
 
 def valid_driver(identifier):
@@ -413,9 +416,11 @@ def set_active(identifier: str, body: Active, request: Request):
     return {'ok': True}
 
 @app.get('/api/bookings')
-def list_bookings(request: Request):
+def list_bookings(request: Request, deleted: bool = False):
     user = current_user(request)
-    records = db().all('bookings')
+    if deleted and user['role'] != 'owner':
+        raise HTTPException(403, 'Only owners can view deleted bookings.')
+    records = [b for b in db().all('bookings') if bool(b.get('deletedAt')) == deleted]
     if user['role'] == 'customer':
         records = [b for b in records if b.get('customerId') == user['id']]
     elif user['role'] == 'driver':
@@ -425,6 +430,8 @@ def list_bookings(request: Request):
 @app.post('/api/bookings', status_code=201)
 def create_booking(body: Booking, request: Request):
     actor = staff(request)
+    if body.date <= business_today():
+        raise HTTPException(422, 'New bookings are available from tomorrow onward (India time).')
     driver_name = valid_driver(body.driverId)
     total, advance = cents(body.total), cents(body.advance)
     if advance > total:
@@ -462,7 +469,7 @@ def payment(identifier: str, body: Payment, request: Request):
     mode(body.mode)
     for _ in range(10):
         booking = db().get('bookings', identifier)
-        if not booking:
+        if not booking or booking.get('deletedAt'):
             raise HTTPException(404, 'Booking not found.')
         if not manages(actor, booking):
             raise HTTPException(403, 'You can only collect payments for bookings you created.')
@@ -490,18 +497,21 @@ class BookingEdit(BaseModel):
     time: str = Field(default='', pattern=r'^$|^([01]\d|2[0-3]):[0-5]\d$')
     purpose: str = Field(max_length=120)
     total: float | None = Field(default=None, ge=0, le=10000000, allow_inf_nan=False)
+    source: str = Field(default='', max_length=200)
     driverId: str = Field(default='', max_length=64)
 
 @app.post('/api/bookings/{identifier}/update')
 def update_booking(identifier: str, body: BookingEdit, request: Request):
     actor = staff(request)
     b = db().get('bookings', identifier)
-    if not b:
+    if not b or b.get('deletedAt'):
         raise HTTPException(404, 'Booking not found.')
     if not manages(actor, b):
         raise HTTPException(403, 'You can only edit bookings you created.')
     if b['status'] in ('In progress', 'Completed', 'Cancelled'):
         raise HTTPException(409, 'Only upcoming bookings can be edited.')
+    if str(body.date) != b['date'] and body.date <= business_today():
+        raise HTTPException(422, 'Choose tomorrow or a later travel date (India time).')
     if not body.name.strip():
         raise HTTPException(422, 'Customer name cannot be blank.')
     for number in (body.phone, body.secondary):
@@ -512,7 +522,9 @@ def update_booking(identifier: str, body: BookingEdit, request: Request):
         raise HTTPException(422, 'Agreed fare cannot be less than payments already received.')
     values = body.model_dump(by_alias=True, mode='json')
     values.pop('total'); values.pop('version')
-    updated = {**b, **values, 'totalCents': total, 'driverName': valid_driver(body.driverId)}
+    driver_name = valid_driver(body.driverId) if body.driverId != b.get('driverId', '') else b.get('driverName', '')
+    updated = {**b, **values, 'totalCents': total, 'driverName': driver_name}
+    updated = with_owner_notice(actor, b, updated, 'updated')
     if not db().replace('bookings', identifier, updated, body.version):
         raise HTTPException(409, 'Booking changed. Refresh and try again.')
     audit(actor['id'], 'booking_updated', identifier)
@@ -526,7 +538,7 @@ class TripAction(BaseModel):
 def trip(identifier: str, body: TripAction, request: Request):
     actor = current_user(request)
     b = db().get('bookings', identifier)
-    if not b:
+    if not b or b.get('deletedAt'):
         raise HTTPException(404, 'Booking not found.')
     if actor['role'] not in ('owner', 'employee') and not (actor['role'] == 'driver' and b.get('driverId') == actor['id']):
         raise HTTPException(403, 'You cannot operate this trip.')
@@ -538,10 +550,85 @@ def trip(identifier: str, body: TripAction, request: Request):
         changes = {'status': 'Completed', 'completedAt': datetime.now(ZoneInfo('Asia/Kolkata')).isoformat(), 'completedBy': actor['id']}
     else:
         raise HTTPException(409, 'Trip status changed or this action is not available.')
-    if not db().replace('bookings', identifier, {**b, **changes}, body.version):
+    updated = with_owner_notice(actor, b, {**b, **changes}, 'started' if body.action == 'start' else 'completed')
+    if not db().replace('bookings', identifier, updated, body.version):
         raise HTTPException(409, 'Booking changed. Refresh and try again.')
     audit(actor['id'], 'trip_'+body.action, identifier)
     return booking_view(db().get('bookings', identifier), actor)
+
+def with_owner_notice(actor, old, updated, action):
+    if actor['role'] != 'owner':
+        return updated
+    recipients = sorted({old.get('createdBy'), old.get('customerId'), old.get('driverId'), updated.get('driverId')} - {None, '', 'excel-import', actor['id']})
+    if not recipients:
+        return updated
+    notice = {'id': old['id'] + ':' + str(old['version'] + 1), 'bookingId': old['id'], 'recipients': recipients,
+              'message': 'An owner ' + action + ' booking ' + old['id'] + '.', 'at': datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()}
+    return {**updated, 'ownerUpdates': old.get('ownerUpdates', []) + [notice]}
+
+def notifications_for(user):
+    notices = [n for b in db().all('bookings') for n in b.get('ownerUpdates', []) if user['id'] in n['recipients']]
+    return sorted(notices, key=lambda n: n['at'], reverse=True)[:100]
+
+@app.get('/api/notifications')
+def notifications(request: Request):
+    user = current_user(request)
+    return [{k: n[k] for k in ('id', 'bookingId', 'message', 'at')} | {'read': db().get('notification_reads', user['id']+':'+n['id']) is not None} for n in notifications_for(user)]
+
+class ReadNotifications(BaseModel):
+    ids: list[str] = Field(max_length=100)
+
+@app.post('/api/notifications/read')
+def read_notifications(body: ReadNotifications, request: Request):
+    user = current_user(request)
+    allowed = {n['id'] for n in notifications_for(user)}
+    for identifier in set(body.ids) & allowed:
+        db().create('notification_reads', user['id']+':'+identifier, {'at': time.time()})
+    return {'ok': True}
+
+class VersionAction(BaseModel):
+    version: int = Field(ge=1)
+
+@app.post('/api/bookings/{identifier}/delete')
+def delete_booking(identifier: str, body: VersionAction, request: Request):
+    actor = staff(request, True)
+    b = db().get('bookings', identifier)
+    if not b or b.get('deletedAt'):
+        raise HTTPException(404, 'Booking not found.')
+    if b['status'] == 'In progress':
+        raise HTTPException(409, 'End the active trip before deleting its booking.')
+    updated = with_owner_notice(actor, b, {**b, 'deletedAt': datetime.now(ZoneInfo('Asia/Kolkata')).isoformat(), 'deletedBy': actor['id']}, 'deleted')
+    if not db().replace('bookings', identifier, updated, body.version):
+        raise HTTPException(409, 'Booking changed. Refresh and try again.')
+    audit(actor['id'], 'booking_deleted', identifier)
+    return {'ok': True}
+
+@app.post('/api/bookings/{identifier}/restore')
+def restore_booking(identifier: str, body: VersionAction, request: Request):
+    actor = staff(request, True)
+    b = db().get('bookings', identifier)
+    if not b or not b.get('deletedAt'):
+        raise HTTPException(404, 'Deleted booking not found.')
+    updated = {**b}; updated.pop('deletedAt'); updated.pop('deletedBy', None)
+    updated = with_owner_notice(actor, b, updated, 'restored')
+    if not db().replace('bookings', identifier, updated, body.version):
+        raise HTTPException(409, 'Booking changed. Refresh and try again.')
+    audit(actor['id'], 'booking_restored', identifier)
+    return {'ok': True}
+
+class RoleChange(BaseModel):
+    role: str
+
+@app.post('/api/users/{identifier}/role')
+def change_role(identifier: str, body: RoleChange, request: Request):
+    actor = staff(request, True)
+    user = target_user(identifier)
+    if user['role'] == 'owner' or body.role not in ('customer', 'employee', 'driver'):
+        raise HTTPException(422, 'Only customer, employee and driver roles can be changed here.')
+    if not db().replace('users', user['email'], {**user, 'role': body.role, 'sessionVersion': user['sessionVersion']+1}, user['version']):
+        raise HTTPException(409, 'Account changed. Try again.')
+    audit(actor['id'], 'role_changed_to_'+body.role, identifier)
+    return {'ok': True}
 
 @app.api_route('/', methods=['GET', 'HEAD'])
 def index():
