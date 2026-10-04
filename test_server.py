@@ -60,6 +60,15 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await employee.get('/api/users')).status_code, 403)
         self.assertEqual((await a.get('/api/customers')).status_code, 403)
 
+    async def test_imported_booking_with_unknown_fare(self):
+        b = {'id': 'RSS-IMPORT-TEST', 'customerId': None, 'totalCents': None, 'paidCents': 110000, 'status': 'Pending', 'payments': [{'cents': 110000, 'mode': 'Not recorded', 'date': '', 'by': 'Excel import', 'requestId': 'source-advance'}]}
+        server.db().create('bookings', b['id'], b)
+        rows = (await self.owner.get('/api/bookings')).json()
+        self.assertIsNone(rows[0]['total'])
+        self.assertEqual(rows[0]['payments'][0]['amount'], 1100)
+        result = await self.owner.post('/api/bookings/'+b['id']+'/payments', json={'amount': 100, 'mode': 'Cash', 'requestId': str(uuid.uuid4())})
+        self.assertEqual(result.status_code, 409)
+
     async def test_payment_idempotency_and_concurrency(self):
         booking = self.booking()
         first = await self.owner.post('/api/bookings', json=booking)

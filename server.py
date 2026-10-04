@@ -278,7 +278,7 @@ def mode(value):
 
 def booking_view(b):
     # Internal author and concurrency data never leave the API.
-    return {**{k: v for k, v in b.items() if k not in ('version', 'totalCents', 'paidCents', 'createdBy', 'requestId')}, 'total': b['totalCents'] / 100, 'payments': [{k: v for k, v in p.items() if k not in ('cents', 'requestId')} | {'amount': p['cents'] / 100} for p in b['payments']]}
+    return {**{k: v for k, v in b.items() if k not in ('version', 'totalCents', 'paidCents', 'createdBy', 'requestId')}, 'total': b['totalCents'] / 100 if b.get('totalCents') is not None else None, 'payments': [{k: v for k, v in p.items() if k not in ('cents', 'requestId')} | {'amount': p['cents'] / 100} for p in b['payments']]}
 
 @app.api_route('/api/health', methods=['GET', 'HEAD'])
 def health():
@@ -425,6 +425,8 @@ def payment(identifier: str, body: Payment, request: Request):
             raise HTTPException(404, 'Booking not found.')
         if any(p['requestId'] == body.requestId for p in booking['payments']):
             return booking_view(booking)
+        if booking.get('totalCents') is None:
+            raise HTTPException(409, 'Set the agreed fare before recording another payment.')
         if booking['status'] == 'Cancelled' or amount > booking['totalCents'] - booking['paidCents']:
             raise HTTPException(409, 'Balance changed or payment exceeds the remaining amount. Refresh the booking.')
         updated = {**booking, 'paidCents': booking['paidCents'] + amount, 'payments': booking['payments'] + [{'cents': amount, 'mode': body.mode, 'date': str(date.today()), 'by': actor['name'], 'requestId': body.requestId}]}
