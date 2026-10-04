@@ -34,7 +34,11 @@ async function enterWorkspace(){
   clearInterval(pollTimer);pollTimer=setInterval(async()=>{if(document.hidden||$('#modal').open)return;try{await refresh(true)}catch(error){if(account)$('#sync-status').textContent='Updates paused: '+error.message}},15000);
 }
 async function logout(){try{await api('/api/logout',{})}catch(error){toast('Could not sign out: '+error.message);return}showLogin()}
-$('#logout').onclick=logout;$('#change-password').onclick=()=>showPassword();
+$('#logout').onclick=logout;
+function renderProfile(){
+  $('#content').innerHTML+=`<section class="profile-settings"><h2>Account details</h2><div class="detail-grid">${[['Name',account.name],['Email address',account.email],['Role',account.role]].map(([label,value])=>`<div><small>${label}</small><strong>${escape(value)}</strong></div>`).join('')}</div><h2>Security</h2><p class="subtitle">Update the password you use to sign in.</p><button class="primary" id="profile-password">Change password</button></section>`;
+  $('#profile-password').onclick=()=>showPassword();
+}
 function renderTeam(){
   $('#content').innerHTML+=`<div class="section-head"><p class="subtitle">Create accounts and share temporary passwords privately. No email is sent.</p><button class="primary" id="create-account">＋ Create account</button></div>${team.map(u=>`<div class="team-row"><span class="avatar">${escape(u.name.slice(0,2).toUpperCase())}</span><div><h3>${escape(u.name)}</h3><p>${escape(u.email)} · ${escape(u.role)} · ${u.active?'Active':'Disabled'}${u.mustChangePassword?' · Password change required':''}</p></div>${u.id!==account.id?`<button class="text-btn" data-reset="${u.id}">Reset password</button>${u.role!=='owner'?`<button class="text-btn" data-active="${u.id}">${u.active?'Disable':'Enable'}</button>`:''}`:''}</div>`).join('')}`;
   $('#create-account').onclick=createAccount;
