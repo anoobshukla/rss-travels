@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: rss-travels-preview
+    runtime: static
+    buildCommand: "echo 'RSS Travels static preview ready'"
+    staticPublishPath: .
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
