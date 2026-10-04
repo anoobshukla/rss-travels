@@ -13,7 +13,8 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -183,7 +184,9 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 
 @app.exception_handler(RequestValidationError)
 async def invalid_input(request, error):
-    return JSONResponse({'detail': 'Please check the fields. Passwords need 12–128 characters and amounts need valid numbers.'}, status_code=422)
+    labels = {'phone': 'Contact number', 'secondary': 'Secondary contact', 'from': 'Pickup location', 'to': 'Drop location', 'requestId': 'Request identifier'}
+    messages = [labels.get(str(e['loc'][-1]), str(e['loc'][-1])) + ': ' + e['msg'] for e in error.errors()]
+    return JSONResponse({'detail': '; '.join(messages)}, status_code=422)
 
 @app.middleware('http')
 async def security(request, call_next):
@@ -256,6 +259,7 @@ class Booking(BaseModel):
     total: float = Field(ge=0, le=10000000, allow_inf_nan=False)
     advance: float = Field(ge=0, le=10000000, allow_inf_nan=False)
     mode: str
+    driverId: str = Field(default='', max_length=64)
     customerEmail: str = Field(default='', max_length=254)
     requestId: str = Field(pattern=r'^[a-f0-9-]{36}$')
 
@@ -276,9 +280,42 @@ def mode(value):
         raise HTTPException(422, 'Choose a supported payment mode.')
     return value
 
-def booking_view(b):
-    # Internal author and concurrency data never leave the API.
-    return {**{k: v for k, v in b.items() if k not in ('version', 'totalCents', 'paidCents', 'createdBy', 'requestId')}, 'total': b['totalCents'] / 100 if b.get('totalCents') is not None else None, 'payments': [{k: v for k, v in p.items() if k not in ('cents', 'requestId')} | {'amount': p['cents'] / 100} for p in b['payments']]}
+def business_today():
+    return datetime.now(ZoneInfo('Asia/Kolkata')).date()
+
+def manages(user, b):
+    return user['role'] == 'owner' or (user['role'] == 'employee' and b.get('createdBy') == user['id'])
+
+def booking_view(b, user=None):
+    financial = user is None or user['role'] in ('owner', 'customer') or manages(user, b)
+    keys = ('id', 'name', 'phone', 'secondary', 'car', 'from', 'to', 'date', 'time', 'purpose', 'status', 'driverId', 'driverName', 'startedAt', 'completedAt')
+    result = {k: b.get(k, '') for k in keys}
+    result.update(version=b.get('version', 1), customerId=b.get('customerId'), financialVisible=financial,
+                  isMine=user is not None and b.get('createdBy') == user['id'],
+                  canEdit=user is not None and manages(user, b) and b['status'] not in ('In progress', 'Completed', 'Cancelled'))
+    operator = user is not None and (user['role'] in ('owner', 'employee') or (user['role'] == 'driver' and b.get('driverId') == user['id']))
+    on_date = b.get('date') == str(business_today())
+    result['canStart'] = operator and on_date and b['status'] in ('Pending', 'Confirmed')
+    result['canComplete'] = operator and on_date and b['status'] == 'In progress'
+    if financial:
+        result.update(total=b['totalCents'] / 100 if b.get('totalCents') is not None else None,
+                      receipt=b.get('receipt', ''), importSource=b.get('importSource'),
+                      payments=[{k: v for k, v in p.items() if k not in ('cents', 'requestId')} | {'amount': p['cents'] / 100} for p in b['payments']],
+                      canPay=user is not None and manages(user, b))
+    return result
+
+def valid_driver(identifier):
+    if not identifier:
+        return ''
+    user = target_user(identifier)
+    if user['role'] != 'driver' or not user['active']:
+        raise HTTPException(422, 'Select an active driver.')
+    return user['name']
+
+@app.get('/api/drivers')
+def drivers(request: Request):
+    staff(request)
+    return [{'id': u['id'], 'name': u['name']} for u in db().all('users') if u['role'] == 'driver' and u['active']]
 
 @app.api_route('/api/health', methods=['GET', 'HEAD'])
 def health():
@@ -338,7 +375,7 @@ def customers(request: Request):
 @app.post('/api/users', status_code=201)
 def create_user(body: NewUser, request: Request):
     actor = staff(request, True)
-    if body.role not in ('owner', 'employee', 'customer') or not body.name.strip():
+    if body.role not in ('owner', 'employee', 'customer', 'driver') or not body.name.strip():
         raise HTTPException(422, 'Choose a valid name and role.')
     user = {'id': secrets.token_hex(16), 'email': email(body.email), 'name': body.name.strip(), 'role': body.role, 'passwordHash': password_hash(body.password), 'active': True, 'mustChangePassword': True, 'sessionVersion': 1}
     if not db().create('users', user['email'], user):
@@ -378,20 +415,24 @@ def set_active(identifier: str, body: Active, request: Request):
 @app.get('/api/bookings')
 def list_bookings(request: Request):
     user = current_user(request)
-    if db().mongo:
-        query = {'customerId': user['id']} if user['role'] == 'customer' else {}
-        records = list(db().db.bookings.find(query, {'_id': 0}))
-    else:
-        records = [b for b in db().all('bookings') if user['role'] != 'customer' or b['customerId'] == user['id']]
-    return [booking_view(b) for b in records]
+    records = db().all('bookings')
+    if user['role'] == 'customer':
+        records = [b for b in records if b.get('customerId') == user['id']]
+    elif user['role'] == 'driver':
+        records = [b for b in records if b.get('driverId') == user['id']]
+    return [booking_view(b, user) for b in records]
 
 @app.post('/api/bookings', status_code=201)
 def create_booking(body: Booking, request: Request):
     actor = staff(request)
+    driver_name = valid_driver(body.driverId)
     total, advance = cents(body.total), cents(body.advance)
     if advance > total:
         raise HTTPException(422, 'Advance cannot exceed the agreed fare.')
     mode(body.mode)
+    for number in (body.phone, body.secondary):
+        if number and not re.fullmatch(r'[0-9+ ()-]{7,20}', number):
+            raise HTTPException(422, 'Contact numbers need 7–20 valid characters.')
     values = body.model_dump(by_alias=True, mode='json')
     for field in ('name', 'car', 'from', 'to', 'purpose'):
         values[field] = values[field].strip()
@@ -406,13 +447,13 @@ def create_booking(body: Booking, request: Request):
     identifier = 'RSS-' + hashlib.sha256((actor['id'] + body.requestId).encode()).hexdigest()[:16].upper()
     existing = db().get('bookings', identifier)
     if existing:
-        return booking_view(existing)
+        return booking_view(existing, actor)
     for field in ('total', 'advance', 'mode', 'customerEmail'):
         values.pop(field)
-    booking = {**values, 'id': identifier, 'customerId': customer_id, 'totalCents': total, 'paidCents': advance, 'status': 'Confirmed', 'createdBy': actor['id'], 'payments': [{'cents': advance, 'mode': body.mode, 'date': str(date.today()), 'by': actor['name'], 'requestId': body.requestId}] if advance else []}
+    booking = {**values, 'id': identifier, 'customerId': customer_id, 'totalCents': total, 'paidCents': advance, 'status': 'Confirmed', 'createdBy': actor['id'], 'driverName': driver_name, 'payments': [{'cents': advance, 'mode': body.mode, 'date': str(business_today()), 'by': actor['name'], 'requestId': body.requestId}] if advance else []}
     if db().create('bookings', identifier, booking):
         audit(actor['id'], 'booking_created', identifier)
-    return booking_view(db().get('bookings', identifier))
+    return booking_view(db().get('bookings', identifier), actor)
 
 @app.post('/api/bookings/{identifier}/payments')
 def payment(identifier: str, body: Payment, request: Request):
@@ -423,17 +464,84 @@ def payment(identifier: str, body: Payment, request: Request):
         booking = db().get('bookings', identifier)
         if not booking:
             raise HTTPException(404, 'Booking not found.')
+        if not manages(actor, booking):
+            raise HTTPException(403, 'You can only collect payments for bookings you created.')
         if any(p['requestId'] == body.requestId for p in booking['payments']):
-            return booking_view(booking)
+            return booking_view(booking, actor)
         if booking.get('totalCents') is None:
             raise HTTPException(409, 'Set the agreed fare before recording another payment.')
         if booking['status'] == 'Cancelled' or amount > booking['totalCents'] - booking['paidCents']:
             raise HTTPException(409, 'Balance changed or payment exceeds the remaining amount. Refresh the booking.')
-        updated = {**booking, 'paidCents': booking['paidCents'] + amount, 'payments': booking['payments'] + [{'cents': amount, 'mode': body.mode, 'date': str(date.today()), 'by': actor['name'], 'requestId': body.requestId}]}
+        updated = {**booking, 'paidCents': booking['paidCents'] + amount, 'payments': booking['payments'] + [{'cents': amount, 'mode': body.mode, 'date': str(business_today()), 'by': actor['name'], 'requestId': body.requestId}]}
         if db().replace('bookings', identifier, updated, booking['version']):
             audit(actor['id'], 'payment_recorded', identifier)
-            return booking_view(updated)
+            return booking_view(updated, actor)
     raise HTTPException(409, 'Another payment is being saved. Please refresh and retry.')
+
+class BookingEdit(BaseModel):
+    version: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=120)
+    phone: str = Field(default='', max_length=20)
+    secondary: str = Field(default='', max_length=20)
+    car: str = Field(default='', max_length=120)
+    from_: str = Field(alias='from', max_length=200)
+    to: str = Field(default='', max_length=200)
+    date: date
+    time: str = Field(default='', pattern=r'^$|^([01]\d|2[0-3]):[0-5]\d$')
+    purpose: str = Field(max_length=120)
+    total: float | None = Field(default=None, ge=0, le=10000000, allow_inf_nan=False)
+    driverId: str = Field(default='', max_length=64)
+
+@app.post('/api/bookings/{identifier}/update')
+def update_booking(identifier: str, body: BookingEdit, request: Request):
+    actor = staff(request)
+    b = db().get('bookings', identifier)
+    if not b:
+        raise HTTPException(404, 'Booking not found.')
+    if not manages(actor, b):
+        raise HTTPException(403, 'You can only edit bookings you created.')
+    if b['status'] in ('In progress', 'Completed', 'Cancelled'):
+        raise HTTPException(409, 'Only upcoming bookings can be edited.')
+    if not body.name.strip():
+        raise HTTPException(422, 'Customer name cannot be blank.')
+    for number in (body.phone, body.secondary):
+        if number and (not re.fullmatch(r'[0-9+ ()-]{7,20}', number)):
+            raise HTTPException(422, 'Contact numbers need 7–20 characters using digits, spaces, +, - or parentheses.')
+    total = cents(body.total) if body.total is not None else None
+    if total is not None and total < b['paidCents']:
+        raise HTTPException(422, 'Agreed fare cannot be less than payments already received.')
+    values = body.model_dump(by_alias=True, mode='json')
+    values.pop('total'); values.pop('version')
+    updated = {**b, **values, 'totalCents': total, 'driverName': valid_driver(body.driverId)}
+    if not db().replace('bookings', identifier, updated, body.version):
+        raise HTTPException(409, 'Booking changed. Refresh and try again.')
+    audit(actor['id'], 'booking_updated', identifier)
+    return booking_view(db().get('bookings', identifier), actor)
+
+class TripAction(BaseModel):
+    action: str
+    version: int = Field(ge=1)
+
+@app.post('/api/bookings/{identifier}/trip')
+def trip(identifier: str, body: TripAction, request: Request):
+    actor = current_user(request)
+    b = db().get('bookings', identifier)
+    if not b:
+        raise HTTPException(404, 'Booking not found.')
+    if actor['role'] not in ('owner', 'employee') and not (actor['role'] == 'driver' and b.get('driverId') == actor['id']):
+        raise HTTPException(403, 'You cannot operate this trip.')
+    if b['date'] != str(business_today()):
+        raise HTTPException(409, 'Trips can only start and end on the booking date (India time).')
+    if body.action == 'start' and b['status'] in ('Pending', 'Confirmed'):
+        changes = {'status': 'In progress', 'startedAt': datetime.now(ZoneInfo('Asia/Kolkata')).isoformat(), 'startedBy': actor['id']}
+    elif body.action == 'complete' and b['status'] == 'In progress':
+        changes = {'status': 'Completed', 'completedAt': datetime.now(ZoneInfo('Asia/Kolkata')).isoformat(), 'completedBy': actor['id']}
+    else:
+        raise HTTPException(409, 'Trip status changed or this action is not available.')
+    if not db().replace('bookings', identifier, {**b, **changes}, body.version):
+        raise HTTPException(409, 'Booking changed. Refresh and try again.')
+    audit(actor['id'], 'trip_'+body.action, identifier)
+    return booking_view(db().get('bookings', identifier), actor)
 
 @app.api_route('/', methods=['GET', 'HEAD'])
 def index():

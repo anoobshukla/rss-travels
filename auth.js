@@ -28,8 +28,8 @@ async function refresh(background=false){
   $('#sync-status').textContent='✓ Shared workspace · Updated '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
 }
 async function enterWorkspace(){
-  role=account.role;page=role==='customer'?'bookings':'overview';query='';filter='All';
-  try{customers=role==='customer'?[]:await api('/api/customers');team=role==='owner'?await api('/api/users'):[];await refresh()}catch(error){showLogin(error.message);return}
+  role=account.role;page=['customer','driver'].includes(role)?'bookings':'overview';query='';filter='All';
+  try{customers=['owner','employee'].includes(role)?await api('/api/customers'):[];drivers=['owner','employee'].includes(role)?await api('/api/drivers'):[];team=role==='owner'?await api('/api/users'):[];await refresh()}catch(error){showLogin(error.message);return}
   $('#auth-screen').hidden=true;$('#app-screen').hidden=false;document.body.classList.remove('signed-out');$('#account-name').textContent=account.name;
   clearInterval(pollTimer);pollTimer=setInterval(async()=>{if(document.hidden||$('#modal').open)return;try{await refresh(true)}catch(error){if(account)$('#sync-status').textContent='Updates paused: '+error.message}},15000);
 }
@@ -41,9 +41,9 @@ function renderTeam(){
   document.querySelectorAll('[data-reset]').forEach(b=>b.onclick=()=>resetAccount(b.dataset.reset));
   document.querySelectorAll('[data-active]').forEach(b=>b.onclick=async()=>{const user=team.find(u=>u.id===b.dataset.active);b.disabled=true;try{await api('/api/users/'+user.id+'/active',{active:!user.active});await reloadTeam();toast('Account access updated')}catch(error){toast(error.message);b.disabled=false}});
 }
-async function reloadTeam(){team=await api('/api/users');customers=await api('/api/customers');render()}
+async function reloadTeam(){drivers=await api('/api/drivers');team=await api('/api/users');customers=await api('/api/customers');render()}
 function createAccount(){
-  openModal(`${modalHead('Create an account')}<p class="info">Share the temporary password privately. This person must change it on first login. No email will be sent.</p><form id="account-form"><div class="fields"><label class="wide">Full name<input name="name" required maxlength="120"></label><label class="wide">Email address<input type="email" name="email" required maxlength="254" autocomplete="off"></label><label>Role<select name="role"><option value="customer">Customer — own bookings</option><option value="employee">Employee — bookings & payments</option><option value="owner">Owner — full access</option></select></label><label>Temporary password<input type="password" name="password" required minlength="12" maxlength="128" autocomplete="new-password"></label></div><p class="error" id="account-error" role="alert"></p><div class="form-actions"><button class="primary">Create account</button></div></form>`);
+  openModal(`${modalHead('Create an account')}<p class="info">Share the temporary password privately. This person must change it on first login. No email will be sent.</p><form id="account-form"><div class="fields"><label class="wide">Full name<input name="name" required maxlength="120"></label><label class="wide">Email address<input type="email" name="email" required maxlength="254" autocomplete="off"></label><label>Role<select name="role"><option value="customer">Customer — own bookings</option><option value="employee">Employee — bookings & payments</option><option value="driver">Driver — assigned trips only</option><option value="owner">Owner — full access</option></select></label><label>Temporary password<input type="password" name="password" required minlength="12" maxlength="128" autocomplete="new-password"></label></div><p class="error" id="account-error" role="alert"></p><div class="form-actions"><button class="primary">Create account</button></div></form>`);
   $('#account-form').onsubmit=async e=>{e.preventDefault();const button=e.target.querySelector('button');button.disabled=true;try{await api('/api/users',Object.fromEntries(new FormData(e.target)));$('#modal').close();await reloadTeam();toast('Account created. Share its temporary password privately.')}catch(error){$('#account-error').textContent=error.message}finally{button.disabled=false}};
 }
 function resetAccount(id){

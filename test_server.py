@@ -111,5 +111,53 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await c.get('/'+name)).status_code, 404)
         self.assertEqual((await c.get('/auth.js')).status_code, 200)
 
+    async def test_employee_scope_and_driver_workflow(self):
+        from unittest.mock import patch
+        employee, eu = await self.user('creator', 'employee')
+        other, _ = await self.user('other', 'employee')
+        driver, du = await self.user('driver', 'driver')
+        outsider, _ = await self.user('outsider', 'driver')
+        payload = self.booking(); payload['driverId'] = du['id']
+        response = await employee.post('/api/bookings', json=payload)
+        self.assertEqual(response.status_code, 201, response.text)
+        b = response.json(); path = '/api/bookings/'+b['id']
+        self.assertTrue(b['isMine']); self.assertTrue(b['canEdit'])
+        hidden = (await other.get('/api/bookings')).json()[0]
+        for key in ('total','payments','importSource','receipt'):
+            self.assertNotIn(key, hidden)
+        self.assertFalse(hidden['canEdit'])
+        self.assertEqual((await other.post(path+'/payments', json={'amount':1,'mode':'Cash','requestId':str(uuid.uuid4())})).status_code,403)
+        edit = {k:payload[k] for k in ('name','phone','car','from','to','date','time','purpose','total','driverId')}; edit['version']=b['version']
+        self.assertEqual((await other.post(path+'/update',json=edit)).status_code,403)
+        self.assertEqual((await employee.post(path+'/update',json={**edit,'total':500})).status_code,422)
+        changed = await employee.post(path+'/update',json={**edit,'total':12000})
+        self.assertEqual(changed.status_code,200,changed.text)
+        self.assertEqual(changed.json()['payments'],b['payments'])
+        self.assertEqual((await employee.post(path+'/update',json=edit)).status_code,409)
+        self.assertEqual((await outsider.get('/api/bookings')).json(),[])
+        self.assertNotIn('payments',(await driver.get('/api/bookings')).json()[0])
+        self.assertEqual((await driver.post('/api/bookings',json=payload)).status_code,403)
+        self.assertEqual((await driver.post(path+'/update',json=edit)).status_code,403)
+        version=changed.json()['version']
+        with patch('server.business_today',return_value=server.date(2026,11,14)):
+            self.assertEqual((await driver.post(path+'/trip',json={'action':'start','version':version})).status_code,409)
+        with patch('server.business_today',return_value=server.date(2026,11,15)):
+            self.assertEqual((await outsider.post(path+'/trip',json={'action':'start','version':version})).status_code,403)
+            self.assertEqual((await driver.post(path+'/trip',json={'action':'complete','version':version})).status_code,409)
+            started=await driver.post(path+'/trip',json={'action':'start','version':version})
+            self.assertEqual(started.status_code,200,started.text)
+            self.assertEqual((await employee.post(path+'/update',json={**edit,'version':started.json()['version']})).status_code,409)
+            finished=await other.post(path+'/trip',json={'action':'complete','version':started.json()['version']})
+            self.assertEqual(finished.status_code,200,finished.text)
+            self.assertEqual(finished.json()['status'],'Completed')
+        self.assertEqual(server.db().get('bookings',b['id'])['createdBy'],eu['id'])
+
+    async def test_booking_field_errors(self):
+        payload=self.booking(); payload['phone']='8'
+        r=await self.owner.post('/api/bookings',json=payload)
+        self.assertEqual(r.status_code,422)
+        self.assertIn('Contact number',r.json()['detail'])
+        self.assertNotIn('assword',r.json()['detail'])
+
 if __name__ == '__main__':
     unittest.main()
