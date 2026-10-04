@@ -161,9 +161,22 @@ async def lifespan(app):
         for kind in ('sessions', 'login_limits'):
             if store.mongo:
                 store.db[kind].delete_many({'expires': {'$lt': time.time()}})
-    except Exception:
+    except Exception as error:
         store = None
-        print('RSS Travels setup incomplete. Check database connectivity and owner configuration. Secrets are not logged.')
+        # Report only fixed diagnostic categories, never exception messages: Mongo
+        # exceptions can contain the connection URI, username or other secrets.
+        from pymongo.errors import ServerSelectionTimeoutError, OperationFailure, ConfigurationError, InvalidURI
+        if isinstance(error, ServerSelectionTimeoutError):
+            reason = 'DATABASE_UNREACHABLE: Check Atlas Network Access for this service outbound IP ranges and cluster availability.'
+        elif isinstance(error, OperationFailure):
+            reason = 'DATABASE_AUTH_OR_PERMISSION: Check the database username, rotated password, and read/write permissions.'
+        elif isinstance(error, (ConfigurationError, InvalidURI)):
+            reason = 'DATABASE_CONNECTION_FORMAT: Check the connection string format and cluster DNS.'
+        elif isinstance(error, HTTPException):
+            reason = 'OWNER_CONFIGURATION: Check the owner email and password length (12-128 characters).'
+        else:
+            reason = 'CONFIGURATION_REQUIRED: Check MONGODB_URI and the HTTPS APP_ORIGIN.'
+        print('RSS Travels setup incomplete. ' + reason, flush=True)
     yield
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -267,7 +280,7 @@ def booking_view(b):
     # Internal author and concurrency data never leave the API.
     return {**{k: v for k, v in b.items() if k not in ('version', 'totalCents', 'paidCents', 'createdBy', 'requestId')}, 'total': b['totalCents'] / 100, 'payments': [{k: v for k, v in p.items() if k not in ('cents', 'requestId')} | {'amount': p['cents'] / 100} for p in b['payments']]}
 
-@app.get('/api/health')
+@app.api_route('/api/health', methods=['GET', 'HEAD'])
 def health():
     return {'ready': store is not None, 'database': os.getenv('MONGODB_DB', 'rss_travels') if store else None}
 
@@ -420,7 +433,7 @@ def payment(identifier: str, body: Payment, request: Request):
             return booking_view(updated)
     raise HTTPException(409, 'Another payment is being saved. Please refresh and retry.')
 
-@app.get('/')
+@app.api_route('/', methods=['GET', 'HEAD'])
 def index():
     return FileResponse(ROOT / 'index.html')
 
