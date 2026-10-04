@@ -1,0 +1,4 @@
+fastapi==0.110.1
+uvicorn==0.29.0
+pymongo==4.16.0
+dnspython==2.6.1
