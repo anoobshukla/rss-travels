@@ -39,3 +39,6 @@ The server serves only explicitly listed public assets. It never serves `.env`, 
 The old static preview is https://rss-travels.onrender.com and has no backend. Its browser-only sample records are not imported into MongoDB. Keep its previous deployment running until the authenticated web service is verified. Do not deploy backend files as a static-site update.
 
 Source: https://github.com/anoobshukla/rss-travels
+
+
+Employee approval workflow: employee-created bookings remain Awaiting approval and are hidden from customers/drivers until an owner approves them. Employee edits are stored as a proposal; confirmed fields, creator and payments are preserved. Owners receive in-app notifications and review requests on Overview. Only owners may approve/reject, with mandatory rejection notes and optimistic version checks. Pending requests block edits and trip starts; rejected requests may be corrected and resubmitted. Existing bookings are grandfathered. Payment receipts remain immediate, accurate records and are preserved independently of booking approval. Notifications are in-app (15-second refresh), not email or push.

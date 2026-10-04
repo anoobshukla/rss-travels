@@ -42,6 +42,11 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         await c.post('/api/password', json={'currentPassword': temporary, 'newPassword': secrets.token_urlsafe(20)})
         return c, user
 
+    async def approve(self, b):
+        r = await self.owner.post('/api/bookings/'+b['id']+'/review', json={'version':b['version'],'requestId':b['approvalRequest']['id'],'decision':'approve'})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
     def booking(self, address=''):
         return {'name': 'Test customer', 'phone': '9000000000', 'car': 'BMW', 'from': 'Prayagraj', 'to': 'Varanasi', 'date': '2026-11-15', 'time': '09:00', 'purpose': 'Wedding', 'total': 10000, 'advance': 1000, 'mode': 'UPI', 'customerEmail': address, 'requestId': str(uuid.uuid4())}
 
@@ -52,6 +57,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         employee, _ = await self.user('employee', 'employee')
         r = await employee.post('/api/bookings', json=self.booking(user_a['email']))
         self.assertEqual(r.status_code, 201)
+        await self.approve(r.json())
         identifier = r.json()['id']
         self.assertEqual(len((await a.get('/api/bookings')).json()), 1)
         self.assertEqual((await b.get('/api/bookings')).json(), [])
@@ -120,7 +126,8 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         payload = self.booking(); payload['driverId'] = du['id']
         response = await employee.post('/api/bookings', json=payload)
         self.assertEqual(response.status_code, 201, response.text)
-        b = response.json(); path = '/api/bookings/'+b['id']
+        await self.approve(response.json())
+        b = (await employee.get('/api/bookings')).json()[0]; path = '/api/bookings/'+b['id']
         self.assertTrue(b['isMine']); self.assertTrue(b['canEdit'])
         hidden = (await other.get('/api/bookings')).json()[0]
         for key in ('total','payments','importSource','receipt'):
@@ -138,7 +145,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('payments',(await driver.get('/api/bookings')).json()[0])
         self.assertEqual((await driver.post('/api/bookings',json=payload)).status_code,403)
         self.assertEqual((await driver.post(path+'/update',json=edit)).status_code,403)
-        version=changed.json()['version']
+        version=(await self.approve(changed.json()))['version']
         with patch('server.business_today',return_value=server.date(2026,11,14)):
             self.assertEqual((await driver.post(path+'/trip',json={'action':'start','version':version})).status_code,409)
         with patch('server.business_today',return_value=server.date(2026,11,15)):
@@ -171,14 +178,14 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
             payload={**self.booking(),'date':'2026-10-06','source':'Phone referral'}
             created=await employee.post('/api/bookings',json=payload)
             self.assertEqual(created.status_code,201,created.text)
-            b=created.json();self.assertEqual(b['source'],'Phone referral')
+            b=await self.approve(created.json());self.assertEqual(b['source'],'Phone referral')
             path='/api/bookings/'+b['id']
             edit={k:payload[k] for k in ('name','phone','car','from','to','date','time','purpose','total','source')};edit['version']=b['version']
             self.assertEqual((await self.owner.post(path+'/update',json={**edit,'date':'2026-10-05'})).status_code,422)
             changed=await self.owner.post(path+'/update',json={**edit,'car':'BMW 5 Series'})
             self.assertEqual(changed.status_code,200,changed.text)
             notes=(await employee.get('/api/notifications')).json()
-            self.assertEqual(len(notes),1);self.assertFalse(notes[0]['read'])
+            self.assertEqual(len(notes),2);self.assertFalse(notes[0]['read'])
             self.assertNotIn('recipients',notes[0])
             self.assertEqual((await other.get('/api/notifications')).json(),[])
             await other.post('/api/notifications/read',json={'ids':[notes[0]['id']]})
@@ -186,7 +193,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
             await employee.post('/api/notifications/read',json={'ids':[notes[0]['id']]})
             self.assertTrue((await employee.get('/api/notifications')).json()[0]['read'])
             self.assertEqual((await self.owner.post(path+'/update',json=edit)).status_code,409)
-            self.assertEqual(len((await employee.get('/api/notifications')).json()),1)
+            self.assertEqual(len((await employee.get('/api/notifications')).json()),2)
             version=changed.json()['version']
             self.assertEqual((await employee.post(path+'/delete',json={'version':version})).status_code,403)
             self.assertEqual((await self.owner.post(path+'/delete',json={'version':version})).status_code,200)
@@ -200,6 +207,62 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
             active=(await employee.get('/api/bookings')).json()[0]
             self.assertEqual(active['payments'],b['payments']);self.assertTrue(active['isMine'])
             self.assertEqual((await self.owner.get('/api/bookings?deleted=true')).json(),[])
+
+    async def test_approval_lifecycle_and_access(self):
+        from unittest.mock import patch
+        employee, eu = await self.user('approval-employee', 'employee')
+        other, _ = await self.user('approval-other', 'employee')
+        customer, cu = await self.user('approval-customer', 'customer')
+        payload = self.booking(cu['email'])
+        b = (await employee.post('/api/bookings', json=payload)).json()
+        path = '/api/bookings/'+b['id']
+        self.assertEqual(b['status'], 'Awaiting approval')
+        self.assertFalse(b['canEdit'])
+        self.assertEqual((await customer.get('/api/bookings')).json(), [])
+        self.assertEqual(len((await self.owner.get('/api/notifications')).json()), 1)
+        await employee.post('/api/bookings', json=payload)
+        self.assertEqual(len((await self.owner.get('/api/notifications')).json()), 1)
+        review = {'version':b['version'],'requestId':b['approvalRequest']['id'],'decision':'approve'}
+        self.assertEqual((await employee.post(path+'/review',json=review)).status_code,403)
+        with patch('server.business_today',return_value=server.date(2026,11,15)):
+            self.assertEqual((await self.owner.post(path+'/trip',json={'action':'start','version':b['version']})).status_code,409)
+        b = await self.approve(b)
+        self.assertEqual(b['status'],'Confirmed')
+        self.assertEqual((await self.owner.post(path+'/review',json=review)).status_code,409)
+        edit={k:payload[k] for k in ('name','phone','car','from','to','date','time','purpose','total')}
+        edit.update(version=b['version'],total=12000,car='Proposed car')
+        pending=(await employee.post(path+'/update',json=edit)).json()
+        self.assertEqual(pending['car'],'BMW')
+        self.assertEqual(pending['total'],10000)
+        self.assertEqual(pending['approvalRequest']['changes']['totalCents'],1200000)
+        hidden=(await other.get('/api/bookings')).json()[0]
+        self.assertNotIn('approvalRequest',hidden)
+        self.assertNotIn('total',hidden)
+        self.assertEqual((await customer.get('/api/bookings')).json()[0]['car'],'BMW')
+        review={'version':pending['version'],'requestId':pending['approvalRequest']['id'],'decision':'reject','reason':'Confirm the fare with customer'}
+        rejected=await self.owner.post(path+'/review',json=review)
+        self.assertEqual(rejected.status_code,200,rejected.text)
+        self.assertEqual(rejected.json()['status'],'Confirmed')
+        self.assertEqual(rejected.json()['car'],'BMW')
+        edit['version']=rejected.json()['version']
+        pending=(await employee.post(path+'/update',json=edit)).json()
+        # Concurrent payment makes a review stale; it must be re-opened.
+        await employee.post(path+'/payments',json={'amount':100,'mode':'Cash','requestId':str(uuid.uuid4())})
+        stale=await self.owner.post(path+'/review',json={'version':pending['version'],'requestId':pending['approvalRequest']['id'],'decision':'approve'})
+        self.assertEqual(stale.status_code,409)
+        pending=(await self.owner.get('/api/bookings')).json()[0]
+        approved=await self.approve(pending)
+        self.assertEqual(approved['total'],12000)
+        self.assertEqual(approved['car'],'Proposed car')
+        self.assertEqual(sum(p['amount'] for p in approved['payments']),1100)
+        self.assertEqual(server.db().get('bookings',b['id'])['createdBy'],eu['id'])
+        # Rejected new bookings can be corrected and resubmitted, but never self-confirmed.
+        new=(await employee.post('/api/bookings',json=self.booking())).json()
+        result=await self.owner.post('/api/bookings/'+new['id']+'/review',json={'version':new['version'],'requestId':new['approvalRequest']['id'],'decision':'reject','reason':'Wrong destination'})
+        edit['version']=result.json()['version']
+        resubmitted=(await employee.post('/api/bookings/'+new['id']+'/update',json=edit)).json()
+        self.assertEqual(resubmitted['status'],'Awaiting approval')
+        self.assertEqual((await self.approve(resubmitted))['car'],'Proposed car')
 
     async def test_role_correction_refreshes_driver_list_and_revokes_session(self):
         customer, user = await self.user('role-correction', 'customer')

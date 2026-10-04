@@ -293,8 +293,8 @@ def booking_view(b, user=None):
     result = {k: b.get(k, '') for k in keys}
     result.update(deleted=bool(b.get('deletedAt')), canDelete=user is not None and user['role'] == 'owner' and not b.get('deletedAt') and b['status'] != 'In progress', version=b.get('version', 1), customerId=b.get('customerId'), financialVisible=financial,
                   isMine=user is not None and b.get('createdBy') == user['id'],
-                  canEdit=user is not None and not b.get('deletedAt') and manages(user, b) and b['status'] not in ('In progress', 'Completed', 'Cancelled'))
-    operator = not b.get('deletedAt') and user is not None and (user['role'] in ('owner', 'employee') or (user['role'] == 'driver' and b.get('driverId') == user['id']))
+                  canEdit=user is not None and not b.get('deletedAt') and manages(user, b) and not b.get('approvalRequest') and b['status'] not in ('In progress', 'Completed', 'Cancelled'))
+    operator = not b.get('approvalRequest') and not b.get('deletedAt') and user is not None and (user['role'] in ('owner', 'employee') or (user['role'] == 'driver' and b.get('driverId') == user['id']))
     on_date = b.get('date') == str(business_today())
     result['canStart'] = operator and on_date and b['status'] in ('Pending', 'Confirmed')
     result['canComplete'] = operator and on_date and b['status'] == 'In progress'
@@ -302,9 +302,12 @@ def booking_view(b, user=None):
         result.update(total=b['totalCents'] / 100 if b.get('totalCents') is not None else None,
                       receipt=b.get('receipt', ''), importSource=b.get('importSource'),
                       payments=[{k: v for k, v in p.items() if k not in ('cents', 'requestId')} | {'amount': p['cents'] / 100} for p in b['payments']],
-                      canPay=user is not None and not b.get('deletedAt') and manages(user, b))
+                      canPay=user is not None and not b.get('deletedAt') and b['status'] not in ('Cancelled', 'Rejected') and manages(user, b))
     if user and user['role'] in ('owner', 'employee'):
         result['source'] = b.get('source', '')
+    if user and manages(user, b):
+        result['approvalRequest'] = b.get('approvalRequest')
+        result['approvalDecision'] = b.get('approvalDecision')
     return result
 
 def valid_driver(identifier):
@@ -425,6 +428,8 @@ def list_bookings(request: Request, deleted: bool = False):
         records = [b for b in records if b.get('customerId') == user['id']]
     elif user['role'] == 'driver':
         records = [b for b in records if b.get('driverId') == user['id']]
+    if user['role'] in ('customer', 'driver'):
+        records = [b for b in records if b['status'] not in ('Awaiting approval', 'Rejected')]
     return [booking_view(b, user) for b in records]
 
 @app.post('/api/bookings', status_code=201)
@@ -458,6 +463,9 @@ def create_booking(body: Booking, request: Request):
     for field in ('total', 'advance', 'mode', 'customerEmail'):
         values.pop(field)
     booking = {**values, 'id': identifier, 'customerId': customer_id, 'totalCents': total, 'paidCents': advance, 'status': 'Confirmed', 'createdBy': actor['id'], 'driverName': driver_name, 'payments': [{'cents': advance, 'mode': body.mode, 'date': str(business_today()), 'by': actor['name'], 'requestId': body.requestId}] if advance else []}
+    if actor['role'] == 'employee':
+        booking['status'] = 'Awaiting approval'
+        booking = request_approval(actor, booking, {}, 'create')
     if db().create('bookings', identifier, booking):
         audit(actor['id'], 'booking_created', identifier)
     return booking_view(db().get('bookings', identifier), actor)
@@ -477,7 +485,7 @@ def payment(identifier: str, body: Payment, request: Request):
             return booking_view(booking, actor)
         if booking.get('totalCents') is None:
             raise HTTPException(409, 'Set the agreed fare before recording another payment.')
-        if booking['status'] == 'Cancelled' or amount > booking['totalCents'] - booking['paidCents']:
+        if booking['status'] in ('Cancelled', 'Rejected') or amount > booking['totalCents'] - booking['paidCents']:
             raise HTTPException(409, 'Balance changed or payment exceeds the remaining amount. Refresh the booking.')
         updated = {**booking, 'paidCents': booking['paidCents'] + amount, 'payments': booking['payments'] + [{'cents': amount, 'mode': body.mode, 'date': str(business_today()), 'by': actor['name'], 'requestId': body.requestId}]}
         if db().replace('bookings', identifier, updated, booking['version']):
@@ -508,6 +516,8 @@ def update_booking(identifier: str, body: BookingEdit, request: Request):
         raise HTTPException(404, 'Booking not found.')
     if not manages(actor, b):
         raise HTTPException(403, 'You can only edit bookings you created.')
+    if b.get('approvalRequest'):
+        raise HTTPException(409, 'Review the pending request before editing this booking.')
     if b['status'] in ('In progress', 'Completed', 'Cancelled'):
         raise HTTPException(409, 'Only upcoming bookings can be edited.')
     if str(body.date) != b['date'] and body.date <= business_today():
@@ -524,7 +534,12 @@ def update_booking(identifier: str, body: BookingEdit, request: Request):
     values.pop('total'); values.pop('version')
     driver_name = valid_driver(body.driverId) if body.driverId != b.get('driverId', '') else b.get('driverName', '')
     updated = {**b, **values, 'totalCents': total, 'driverName': driver_name}
-    updated = with_owner_notice(actor, b, updated, 'updated')
+    if actor['role'] == 'employee':
+        updated = request_approval(actor, b, {**values, 'totalCents': total, 'driverName': driver_name}, 'create' if b['status'] == 'Rejected' else 'update')
+        if b['status'] == 'Rejected':
+            updated['status'] = 'Awaiting approval'
+    else:
+        updated = with_owner_notice(actor, b, updated, 'updated')
     if not db().replace('bookings', identifier, updated, body.version):
         raise HTTPException(409, 'Booking changed. Refresh and try again.')
     audit(actor['id'], 'booking_updated', identifier)
@@ -542,6 +557,8 @@ def trip(identifier: str, body: TripAction, request: Request):
         raise HTTPException(404, 'Booking not found.')
     if actor['role'] not in ('owner', 'employee') and not (actor['role'] == 'driver' and b.get('driverId') == actor['id']):
         raise HTTPException(403, 'You cannot operate this trip.')
+    if b.get('approvalRequest'):
+        raise HTTPException(409, 'Owner approval is required before starting this trip.')
     if b['date'] != str(business_today()):
         raise HTTPException(409, 'Trips can only start and end on the booking date (India time).')
     if body.action == 'start' and b['status'] in ('Pending', 'Confirmed'):
@@ -554,6 +571,53 @@ def trip(identifier: str, body: TripAction, request: Request):
     if not db().replace('bookings', identifier, updated, body.version):
         raise HTTPException(409, 'Booking changed. Refresh and try again.')
     audit(actor['id'], 'trip_'+body.action, identifier)
+    return booking_view(db().get('bookings', identifier), actor)
+
+def request_approval(actor, booking, changes, kind):
+    at = datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()
+    pending = {'id': secrets.token_hex(16), 'kind': kind, 'by': actor['id'], 'name': actor['name'], 'at': at, 'changes': changes}
+    recipients = [u['id'] for u in db().all('users') if u['role'] == 'owner' and u['active']]
+    notice = {'id': booking['id'] + ':request:' + pending['id'], 'bookingId': booking['id'], 'recipients': recipients,
+              'message': actor['name'] + ' requested approval for ' + ('a new booking ' if kind == 'create' else 'changes to booking ') + booking['id'] + '.', 'at': at}
+    return {**booking, 'approvalRequest': pending, 'ownerUpdates': booking.get('ownerUpdates', []) + [notice]}
+
+class ApprovalReview(BaseModel):
+    version: int = Field(ge=1)
+    requestId: str
+    decision: str
+    reason: str = Field(default='', max_length=500)
+
+@app.post('/api/bookings/{identifier}/review')
+def review_booking(identifier: str, body: ApprovalReview, request: Request):
+    actor = staff(request, True)
+    b = db().get('bookings', identifier)
+    if not b or b.get('deletedAt'):
+        raise HTTPException(404, 'Booking not found.')
+    pending = b.get('approvalRequest')
+    if not pending or pending['id'] != body.requestId:
+        raise HTTPException(409, 'This request has already been reviewed or changed.')
+    if body.decision not in ('approve', 'reject'):
+        raise HTTPException(422, 'Choose approve or reject.')
+    if body.decision == 'reject' and not body.reason.strip():
+        raise HTTPException(422, 'Give a reason so the employee can correct the booking.')
+    updated = {**b}
+    if body.decision == 'approve':
+        updated.update(pending['changes'])
+        if updated['date'] < str(business_today()):
+            raise HTTPException(409, 'The travel date has passed. Reject this request and ask for a new date.')
+        if updated.get('totalCents') is not None and updated['totalCents'] < b['paidCents']:
+            raise HTTPException(409, 'Payments now exceed the proposed fare. Reject and request a corrected fare.')
+        valid_driver(updated.get('driverId', ''))
+        updated['status'] = 'Confirmed'
+    elif pending['kind'] == 'create':
+        updated['status'] = 'Rejected'
+    updated['approvalRequest'] = None
+    updated['approvalDecision'] = {'decision': body.decision, 'reason': body.reason.strip(), 'by': actor['name'], 'at': datetime.now(ZoneInfo('Asia/Kolkata')).isoformat()}
+    updated['approvalHistory'] = b.get('approvalHistory', []) + [{**pending, **updated['approvalDecision'], 'requestedBy': pending['by']}]
+    updated = with_owner_notice(actor, b, updated, 'approved' if body.decision == 'approve' else 'rejected the request for')
+    if not db().replace('bookings', identifier, updated, body.version):
+        raise HTTPException(409, 'Booking changed. Refresh and review the latest details.')
+    audit(actor['id'], 'booking_request_' + body.decision, identifier)
     return booking_view(db().get('bookings', identifier), actor)
 
 def with_owner_notice(actor, old, updated, action):
